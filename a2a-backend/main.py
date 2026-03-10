@@ -2,8 +2,8 @@
 """
 A2A Backend - Bridge between assistant-transport protocol and A2A servers.
 
-This server receives assistant-transport requests from the frontend and
-forwards them to an A2A server using the a2a-sdk client with streaming.
+Streams rich A2A events (status updates, artifacts, task states) to the
+frontend as tool call state updates.
 """
 
 import os
@@ -30,109 +30,180 @@ from a2a.types import (
     SendStreamingMessageRequest,
 )
 
-# Load environment variables
 load_dotenv()
 
-# Default A2A server URL (can be overridden per-request from the frontend)
 DEFAULT_A2A_SERVER_URL = os.getenv("A2A_SERVER_URL", "http://localhost:9999")
 
 
-# --- Request models (assistant-transport protocol) ---
+# --- Request models ---
 
 
 class MessagePart(BaseModel):
-    type: str = Field(..., description="The type of message part")
-    text: Optional[str] = Field(None, description="Text content")
-    image: Optional[str] = Field(None, description="Image URL or data")
+    type: str
+    text: Optional[str] = None
+    image: Optional[str] = None
 
 
 class UserMessage(BaseModel):
-    role: str = Field(default="user", description="Message role")
-    parts: List[MessagePart] = Field(..., description="Message parts")
+    role: str = "user"
+    parts: List[MessagePart]
 
 
 class AddMessageCommand(BaseModel):
-    type: str = Field(default="add-message", description="Command type")
-    message: UserMessage = Field(..., description="User message")
+    type: str = "add-message"
+    message: UserMessage
 
 
 class AddToolResultCommand(BaseModel):
-    type: str = Field(default="add-tool-result", description="Command type")
-    toolCallId: str = Field(..., description="ID of the tool call")
-    result: Dict[str, Any] = Field(..., description="Tool execution result")
+    type: str = "add-tool-result"
+    toolCallId: str
+    result: Dict[str, Any]
 
 
 class AssistantRequest(BaseModel):
-    commands: List[Union[AddMessageCommand, AddToolResultCommand]] = Field(
-        ..., description="List of commands to execute"
-    )
-    system: Optional[str] = Field(None, description="System prompt")
-    tools: Optional[Dict[str, Any]] = Field(None, description="Available tools")
-    runConfig: Optional[Dict[str, Any]] = Field(
-        None, description="Run configuration"
-    )
-    state: Optional[Dict[str, Any]] = Field(None, description="State")
-    a2aServerUrl: Optional[str] = Field(
-        None, description="A2A server URL (passed from frontend)"
-    )
+    commands: List[Union[AddMessageCommand, AddToolResultCommand]]
+    system: Optional[str] = None
+    tools: Optional[Dict[str, Any]] = None
+    runConfig: Optional[Dict[str, Any]] = None
+    state: Optional[Dict[str, Any]] = None
+    a2aServerUrl: Optional[str] = None
 
 
-# --- Helper functions ---
+# --- A2A event parsing ---
 
 
-def extract_text_from_a2a_response(data: dict) -> Optional[str]:
-    """Extract text from an A2A response chunk (dict form).
+def parse_a2a_event(data: dict) -> dict:
+    """Parse an A2A streaming event into a structured update.
 
-    Handles multiple response shapes:
-    - Message: result.parts (kind=message)
-    - TaskStatusUpdateEvent: result.status.message.parts
-    - TaskArtifactUpdateEvent: result.artifact.parts
-    - Task: result.artifacts[].parts or result.status.message.parts
+    Returns a dict with:
+      kind: "status-update" | "artifact-update" | "message" | "task" | "unknown"
+      state: TaskState string (if applicable)
+      text: status text (if any)
+      artifact: artifact dict (if applicable)
+      final: whether this is the last event
+      task_id: task id (if available)
     """
     result = data.get("result", {})
     if not isinstance(result, dict):
-        return None
+        return {"kind": "unknown"}
 
-    def extract_from_parts(parts):
-        for part in parts:
-            if isinstance(part, dict) and part.get("kind") == "text":
-                return part.get("text", "")
-        return None
+    kind = result.get("kind", "")
 
-    # Direct message: result.parts (kind=message)
-    if result.get("kind") == "message":
-        parts = result.get("parts", [])
-        text = extract_from_parts(parts)
-        if text is not None:
-            return text
+    # Direct message response
+    if kind == "message":
+        text = _extract_text_from_parts(result.get("parts", []))
+        return {"kind": "message", "text": text}
 
-    # Check status.message.parts (TaskStatusUpdateEvent or Task)
-    status = result.get("status", {})
-    if status and isinstance(status, dict):
+    # TaskStatusUpdateEvent
+    if kind == "status-update":
+        status = result.get("status", {})
+        state = status.get("state", "unknown")
+        message = status.get("message", {})
+        text = None
+        if message and isinstance(message, dict):
+            text = _extract_text_from_parts(message.get("parts", []))
+        return {
+            "kind": "status-update",
+            "state": state,
+            "text": text,
+            "final": result.get("final", False),
+            "task_id": result.get("task_id"),
+        }
+
+    # TaskArtifactUpdateEvent
+    if kind == "artifact-update":
+        artifact = result.get("artifact", {})
+        parsed_artifact = _parse_artifact(artifact)
+        return {
+            "kind": "artifact-update",
+            "artifact": parsed_artifact,
+            "append": result.get("append", False),
+            "last_chunk": result.get("last_chunk", True),
+            "task_id": result.get("task_id"),
+        }
+
+    # Task object (final response)
+    if kind == "task":
+        status = result.get("status", {})
+        state = status.get("state", "unknown")
+        text = None
         message = status.get("message", {})
         if message and isinstance(message, dict):
-            parts = message.get("parts", [])
-            text = extract_from_parts(parts)
-            if text is not None:
-                return text
+            text = _extract_text_from_parts(message.get("parts", []))
+        artifacts = [
+            _parse_artifact(a) for a in result.get("artifacts", []) if isinstance(a, dict)
+        ]
+        return {
+            "kind": "task",
+            "state": state,
+            "text": text,
+            "artifacts": artifacts,
+            "task_id": result.get("id"),
+        }
 
-    # Check artifact.parts (TaskArtifactUpdateEvent)
-    artifact = result.get("artifact", {})
-    if artifact and isinstance(artifact, dict):
-        text = extract_from_parts(artifact.get("parts", []))
-        if text is not None:
-            return text
+    # Unknown / fallback
+    return {"kind": "unknown", "raw": result}
 
-    # Check artifacts[].parts (Task with artifacts)
-    artifacts = result.get("artifacts", [])
-    if artifacts and isinstance(artifacts, list):
-        for art in artifacts:
-            if isinstance(art, dict):
-                text = extract_from_parts(art.get("parts", []))
-                if text is not None:
-                    return text
 
-    return None
+def _extract_text_from_parts(parts: list) -> str | None:
+    texts = []
+    for part in parts:
+        if isinstance(part, dict) and part.get("kind") == "text":
+            texts.append(part.get("text", ""))
+    return "\n".join(texts) if texts else None
+
+
+def _parse_artifact(artifact: dict) -> dict:
+    """Parse an artifact dict into a frontend-friendly format."""
+    parts = []
+    for part in artifact.get("parts", []):
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("kind", "")
+        if kind == "text":
+            parts.append({"kind": "text", "text": part.get("text", "")})
+        elif kind == "data":
+            parts.append({"kind": "data", "data": part.get("data", {})})
+        elif kind == "file":
+            file_info = part.get("file", {})
+            parts.append({
+                "kind": "file",
+                "name": file_info.get("name", "file"),
+                "mimeType": file_info.get("mime_type", ""),
+                "hasBytes": "bytes" in file_info,
+                "uri": file_info.get("uri"),
+            })
+    return {
+        "artifactId": artifact.get("artifact_id", ""),
+        "name": artifact.get("name", ""),
+        "description": artifact.get("description"),
+        "parts": parts,
+    }
+
+
+def _parse_agent_card(agent_card) -> dict:
+    """Convert agent card to a frontend-friendly dict."""
+    skills = []
+    for s in (agent_card.skills or []):
+        skills.append({
+            "id": s.id,
+            "name": s.name,
+            "description": s.description,
+            "tags": s.tags or [],
+            "examples": s.examples or [],
+        })
+    return {
+        "name": agent_card.name,
+        "description": agent_card.description,
+        "version": agent_card.version,
+        "url": agent_card.url,
+        "skills": skills,
+        "streaming": agent_card.capabilities.streaming if agent_card.capabilities else False,
+        "provider": {
+            "organization": agent_card.provider.organization,
+            "url": agent_card.provider.url,
+        } if agent_card.provider else None,
+    }
 
 
 # --- FastAPI app ---
@@ -164,12 +235,10 @@ app.add_middleware(
 
 @app.post("/assistant")
 async def assistant_endpoint(request: AssistantRequest):
-    # Resolve A2A server URL: prefer per-request, fall back to default
     a2a_server_url = request.a2aServerUrl or DEFAULT_A2A_SERVER_URL
 
     async def run_callback(controller: RunController):
         try:
-            # Extract user message from command
             cmd = request.commands[0]
             user_text = ""
 
@@ -179,30 +248,22 @@ async def assistant_endpoint(request: AssistantRequest):
                         user_text = part.text
                         break
 
-                # Add user message to state (LangChain format)
-                controller.state["messages"].append(
-                    {
-                        "type": "human",
-                        "content": [{"type": "text", "text": user_text}],
-                    }
-                )
+                controller.state["messages"].append({
+                    "type": "human",
+                    "content": [{"type": "text", "text": user_text}],
+                })
             elif cmd.type == "add-tool-result":
-                # Pass through tool results
-                controller.state["messages"][-1]["parts"][-1]["result"] = (
-                    cmd.result
-                )
+                controller.state["messages"][-1]["parts"][-1]["result"] = cmd.result
                 return
 
             if not user_text:
-                controller.state["messages"].append(
-                    {
-                        "type": "ai",
-                        "content": "I didn't receive a text message.",
-                    }
-                )
+                controller.state["messages"].append({
+                    "type": "ai",
+                    "content": "I didn't receive a text message.",
+                })
                 return
 
-            # Create AI message with a2a_agent tool call
+            # Create tool call to represent the A2A agent invocation
             tool_call_id = f"call_{uuid4().hex[:8]}"
             tool_call = {
                 "id": tool_call_id,
@@ -210,40 +271,36 @@ async def assistant_endpoint(request: AssistantRequest):
                 "args": {
                     "query": user_text,
                     "serverUrl": a2a_server_url,
-                    "status": "connecting",
-                    "agentName": "",
-                    "response": "",
+                    "taskState": "connecting",
+                    "agentCard": None,
+                    "statusText": "",
+                    "artifacts": [],
+                    "error": None,
                 },
             }
-            controller.state["messages"].append(
-                {
-                    "type": "ai",
-                    "content": "",
-                    "tool_calls": [tool_call],
-                }
-            )
+            controller.state["messages"].append({
+                "type": "ai",
+                "content": "",
+                "tool_calls": [tool_call],
+            })
             ai_idx = len(controller.state["messages"]) - 1
-            tc_args = controller.state["messages"][ai_idx]["tool_calls"][0][
-                "args"
-            ]
+            tc_args = controller.state["messages"][ai_idx]["tool_calls"][0]["args"]
 
-            # Connect to A2A server and stream response
-            async with httpx.AsyncClient(timeout=60.0) as httpx_client:
-                # Resolve agent card
+            # Connect to A2A server
+            async with httpx.AsyncClient(timeout=120.0) as httpx_client:
                 resolver = A2ACardResolver(
                     httpx_client=httpx_client,
                     base_url=a2a_server_url,
                 )
                 agent_card = await resolver.get_agent_card()
-                tc_args["agentName"] = agent_card.name
+                tc_args["agentCard"] = _parse_agent_card(agent_card)
+                tc_args["taskState"] = "submitted"
 
-                # Create A2A client
                 a2a_client = A2AClient(
                     httpx_client=httpx_client,
                     agent_card=agent_card,
                 )
 
-                # Build A2A message
                 send_payload: dict[str, Any] = {
                     "message": {
                         "role": "user",
@@ -252,65 +309,96 @@ async def assistant_endpoint(request: AssistantRequest):
                     }
                 }
 
-                # Stream from A2A server
-                tc_args["status"] = "working"
                 latest_text = ""
+                final_state = "completed"
+
                 try:
                     streaming_request = SendStreamingMessageRequest(
                         id=str(uuid4()),
                         params=MessageSendParams(**send_payload),
                     )
-                    stream = a2a_client.send_message_streaming(
-                        streaming_request
-                    )
+                    stream = a2a_client.send_message_streaming(streaming_request)
                     async for chunk in stream:
-                        chunk_dict = chunk.model_dump(
-                            mode="json", exclude_none=True
-                        )
-                        text = extract_text_from_a2a_response(chunk_dict)
-                        if text and text != latest_text:
-                            latest_text = text
-                            tc_args["response"] = text
+                        chunk_dict = chunk.model_dump(mode="json", exclude_none=True)
+                        event = parse_a2a_event(chunk_dict)
+
+                        if event["kind"] == "status-update":
+                            tc_args["taskState"] = event["state"]
+                            if event.get("text"):
+                                latest_text = event["text"]
+                                tc_args["statusText"] = latest_text
+                            if event.get("state") in ("failed", "canceled", "rejected"):
+                                tc_args["error"] = latest_text or event["state"]
+                                final_state = event["state"]
+
+                        elif event["kind"] == "artifact-update":
+                            artifact = event["artifact"]
+                            # Find existing artifact by ID or append
+                            existing = None
+                            for a in tc_args["artifacts"]:
+                                if a["artifactId"] == artifact["artifactId"]:
+                                    existing = a
+                                    break
+                            if existing and event.get("append"):
+                                existing["parts"].extend(artifact["parts"])
+                            elif existing:
+                                existing.update(artifact)
+                            else:
+                                tc_args["artifacts"].append(artifact)
+
+                        elif event["kind"] == "message":
+                            if event.get("text"):
+                                latest_text = event["text"]
+                                tc_args["statusText"] = latest_text
+
+                        elif event["kind"] == "task":
+                            tc_args["taskState"] = event.get("state", "completed")
+                            if event.get("text"):
+                                latest_text = event["text"]
+                                tc_args["statusText"] = latest_text
+                            for a in event.get("artifacts", []):
+                                tc_args["artifacts"].append(a)
+                            final_state = event.get("state", "completed")
+
                 except Exception as e:
-                    print(
-                        f"Streaming failed, falling back to non-streaming: {e}"
-                    )
+                    print(f"Streaming failed, falling back to non-streaming: {e}")
+                    traceback.print_exc()
 
                 # Fallback to non-streaming
-                if not latest_text:
+                if not latest_text and not tc_args["artifacts"]:
                     try:
                         non_streaming_request = SendMessageRequest(
                             id=str(uuid4()),
                             params=MessageSendParams(**send_payload),
                         )
-                        response = await a2a_client.send_message(
-                            non_streaming_request
-                        )
-                        resp_dict = response.model_dump(
-                            mode="json", exclude_none=True
-                        )
-                        text = extract_text_from_a2a_response(resp_dict)
-                        if text:
-                            latest_text = text
-                            tc_args["response"] = text
+                        response = await a2a_client.send_message(non_streaming_request)
+                        resp_dict = response.model_dump(mode="json", exclude_none=True)
+                        event = parse_a2a_event(resp_dict)
+                        if event.get("text"):
+                            latest_text = event["text"]
+                            tc_args["statusText"] = latest_text
+                        for a in event.get("artifacts", []):
+                            tc_args["artifacts"].append(a)
                     except Exception as e2:
                         print(f"Non-streaming also failed: {e2}")
+                        tc_args["error"] = str(e2)
+                        final_state = "failed"
 
-                if not latest_text:
+                if not latest_text and not tc_args["artifacts"]:
                     latest_text = "No response from A2A server."
-                    tc_args["response"] = latest_text
+                    tc_args["statusText"] = latest_text
 
-                # Mark tool call complete and add tool result
-                tc_args["status"] = "complete"
-                controller.state["messages"].append(
-                    {
-                        "type": "tool",
-                        "tool_call_id": tool_call_id,
-                        "name": "a2a_agent",
-                        "content": latest_text,
-                        "status": "success",
-                    }
-                )
+                tc_args["taskState"] = final_state
+
+                # Add tool result message
+                tool_status = "success" if final_state == "completed" else "error"
+                controller.state["messages"].append({
+                    "type": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": "a2a_agent",
+                    "content": latest_text or "Task completed.",
+                    "status": tool_status,
+                })
 
         except Exception as e:
             print(f"Error in A2A bridge: {e}")

@@ -10,14 +10,29 @@ function ThreadWithSuggestions() {
   const aui = useAui({
     suggestions: Suggestions([
       {
-        title: "Say hello",
-        label: "and introduce yourself",
-        prompt: "Hello! Who are you?",
+        title: "Chat",
+        label: "streaming response",
+        prompt: "Explain the A2A protocol in 3 sentences",
       },
       {
-        title: "Tell me about",
-        label: "the A2A protocol",
-        prompt: "What is the A2A (Agent-to-Agent) protocol?",
+        title: "Artifacts",
+        label: "code + data + file",
+        prompt: "/artifacts a fibonacci function in Python",
+      },
+      {
+        title: "Multi-step",
+        label: "input-required state",
+        prompt: "/multistep",
+      },
+      {
+        title: "Failure",
+        label: "error handling",
+        prompt: "/fail",
+      },
+      {
+        title: "Slow task",
+        label: "cancellable",
+        prompt: "/slow",
       },
     ]),
   });
