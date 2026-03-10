@@ -69,81 +69,6 @@ class AssistantRequest(BaseModel):
     a2aServerUrl: Optional[str] = None
 
 
-# --- A2A event parsing ---
-
-
-def parse_a2a_event(data: dict) -> dict:
-    """Parse an A2A streaming event into a structured update.
-
-    Returns a dict with:
-      kind: "status-update" | "artifact-update" | "message" | "task" | "unknown"
-      state: TaskState string (if applicable)
-      text: status text (if any)
-      artifact: artifact dict (if applicable)
-      final: whether this is the last event
-      task_id: task id (if available)
-    """
-    result = data.get("result", {})
-    if not isinstance(result, dict):
-        return {"kind": "unknown"}
-
-    kind = result.get("kind", "")
-
-    # Direct message response
-    if kind == "message":
-        text = _extract_text_from_parts(result.get("parts", []))
-        return {"kind": "message", "text": text}
-
-    # TaskStatusUpdateEvent
-    if kind == "status-update":
-        status = result.get("status", {})
-        state = status.get("state", "unknown")
-        message = status.get("message", {})
-        text = None
-        if message and isinstance(message, dict):
-            text = _extract_text_from_parts(message.get("parts", []))
-        return {
-            "kind": "status-update",
-            "state": state,
-            "text": text,
-            "final": result.get("final", False),
-            "task_id": result.get("task_id"),
-        }
-
-    # TaskArtifactUpdateEvent
-    if kind == "artifact-update":
-        artifact = result.get("artifact", {})
-        parsed_artifact = _parse_artifact(artifact)
-        return {
-            "kind": "artifact-update",
-            "artifact": parsed_artifact,
-            "append": result.get("append", False),
-            "last_chunk": result.get("last_chunk", True),
-            "task_id": result.get("task_id"),
-        }
-
-    # Task object (final response)
-    if kind == "task":
-        status = result.get("status", {})
-        state = status.get("state", "unknown")
-        text = None
-        message = status.get("message", {})
-        if message and isinstance(message, dict):
-            text = _extract_text_from_parts(message.get("parts", []))
-        artifacts = [
-            _parse_artifact(a) for a in result.get("artifacts", []) if isinstance(a, dict)
-        ]
-        return {
-            "kind": "task",
-            "state": state,
-            "text": text,
-            "artifacts": artifacts,
-            "task_id": result.get("id"),
-        }
-
-    # Unknown / fallback
-    return {"kind": "unknown", "raw": result}
-
 
 def _extract_text_from_parts(parts: list) -> str | None:
     texts = []
@@ -319,50 +244,69 @@ async def assistant_endpoint(request: AssistantRequest):
                     )
                     stream = a2a_client.send_message_streaming(streaming_request)
                     async for chunk in stream:
+                        # chunk is Task | Message | TaskStatusUpdateEvent | TaskArtifactUpdateEvent
                         chunk_dict = chunk.model_dump(mode="json", exclude_none=True)
-                        event = parse_a2a_event(chunk_dict)
+                        kind = chunk_dict.get("kind", "")
 
-                        if event["kind"] == "status-update":
-                            tc_args["taskState"] = event["state"]
-                            if event.get("text"):
-                                latest_text = event["text"]
-                                tc_args["statusText"] = latest_text
-                            if event.get("state") in ("failed", "canceled", "rejected"):
-                                tc_args["error"] = latest_text or event["state"]
-                                final_state = event["state"]
+                        if kind == "status-update":
+                            status = chunk_dict.get("status", {})
+                            state = status.get("state", "unknown")
+                            tc_args["taskState"] = state
+                            message = status.get("message", {})
+                            if message:
+                                text = _extract_text_from_parts(message.get("parts", []))
+                                if text:
+                                    latest_text = text
+                                    tc_args["statusText"] = latest_text
+                            if state in ("failed", "canceled", "rejected"):
+                                tc_args["error"] = latest_text or state
+                                final_state = state
+                            elif state == "completed":
+                                final_state = "completed"
 
-                        elif event["kind"] == "artifact-update":
-                            artifact = event["artifact"]
-                            # Find existing artifact by ID or append
+                        elif kind == "artifact-update":
+                            artifact = _parse_artifact(chunk_dict.get("artifact", {}))
                             existing = None
                             for a in tc_args["artifacts"]:
                                 if a["artifactId"] == artifact["artifactId"]:
                                     existing = a
                                     break
-                            if existing and event.get("append"):
+                            if existing and chunk_dict.get("append"):
                                 existing["parts"].extend(artifact["parts"])
                             elif existing:
                                 existing.update(artifact)
                             else:
                                 tc_args["artifacts"].append(artifact)
 
-                        elif event["kind"] == "message":
-                            if event.get("text"):
-                                latest_text = event["text"]
+                        elif kind == "message":
+                            text = _extract_text_from_parts(chunk_dict.get("parts", []))
+                            if text:
+                                latest_text = text
                                 tc_args["statusText"] = latest_text
 
-                        elif event["kind"] == "task":
-                            tc_args["taskState"] = event.get("state", "completed")
-                            if event.get("text"):
-                                latest_text = event["text"]
-                                tc_args["statusText"] = latest_text
-                            for a in event.get("artifacts", []):
-                                tc_args["artifacts"].append(a)
-                            final_state = event.get("state", "completed")
+                        elif kind == "task":
+                            status = chunk_dict.get("status", {})
+                            state = status.get("state", "completed")
+                            tc_args["taskState"] = state
+                            message = status.get("message", {})
+                            if message:
+                                text = _extract_text_from_parts(message.get("parts", []))
+                                if text:
+                                    latest_text = text
+                                    tc_args["statusText"] = latest_text
+                            for a in chunk_dict.get("artifacts", []):
+                                tc_args["artifacts"].append(_parse_artifact(a))
+                            if state in ("failed", "canceled", "rejected"):
+                                tc_args["error"] = latest_text or state
+                            final_state = state
 
                 except Exception as e:
-                    print(f"Streaming failed, falling back to non-streaming: {e}")
-                    traceback.print_exc()
+                    # SSE close errors are expected after stream ends
+                    if latest_text or tc_args["artifacts"]:
+                        print(f"Stream ended (may be normal SSE close): {e}")
+                    else:
+                        print(f"Streaming failed, falling back to non-streaming: {e}")
+                        traceback.print_exc()
 
                 # Fallback to non-streaming
                 if not latest_text and not tc_args["artifacts"]:
@@ -372,13 +316,29 @@ async def assistant_endpoint(request: AssistantRequest):
                             params=MessageSendParams(**send_payload),
                         )
                         response = await a2a_client.send_message(non_streaming_request)
-                        resp_dict = response.model_dump(mode="json", exclude_none=True)
-                        event = parse_a2a_event(resp_dict)
-                        if event.get("text"):
-                            latest_text = event["text"]
-                            tc_args["statusText"] = latest_text
-                        for a in event.get("artifacts", []):
-                            tc_args["artifacts"].append(a)
+                        # response.root.result is Task | Message
+                        result = response.root.result
+                        result_dict = result.model_dump(mode="json", exclude_none=True)
+                        kind = result_dict.get("kind", "")
+                        if kind == "task":
+                            status = result_dict.get("status", {})
+                            message = status.get("message", {})
+                            if message:
+                                text = _extract_text_from_parts(message.get("parts", []))
+                                if text:
+                                    latest_text = text
+                                    tc_args["statusText"] = latest_text
+                            for a in result_dict.get("artifacts", []):
+                                tc_args["artifacts"].append(_parse_artifact(a))
+                            state = status.get("state", "completed")
+                            if state in ("failed", "canceled", "rejected"):
+                                tc_args["error"] = latest_text or state
+                            final_state = state
+                        elif kind == "message":
+                            text = _extract_text_from_parts(result_dict.get("parts", []))
+                            if text:
+                                latest_text = text
+                                tc_args["statusText"] = latest_text
                     except Exception as e2:
                         print(f"Non-streaming also failed: {e2}")
                         tc_args["error"] = str(e2)
